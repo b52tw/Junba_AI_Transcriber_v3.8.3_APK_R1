@@ -1,0 +1,117 @@
+name: Build Junba Android APK v3.8.2 R1
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'android/**'
+      - '.github/workflows/build-android-v3.8.2-r1.yml'
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: junba-android-v382-r1-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-apk:
+    name: Build Android APK R1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Locate Android sdkmanager
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER=""
+          for p in "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "$SDK_ROOT/cmdline-tools/bin/sdkmanager"; do
+            if [ -x "$p" ]; then SDKMANAGER="$p"; break; fi
+          done
+          if [ -z "$SDKMANAGER" ] && [ -d "$SDK_ROOT" ]; then
+            SDKMANAGER="$(find "$SDK_ROOT" -type f -name sdkmanager -perm -111 2>/dev/null | head -n 1 || true)"
+          fi
+          if [ -z "$SDKMANAGER" ]; then
+            SDK_ROOT="$HOME/android-sdk"
+            mkdir -p "$SDK_ROOT/cmdline-tools"
+            curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o /tmp/cmdline-tools.zip
+            rm -rf /tmp/android-cli && mkdir -p /tmp/android-cli
+            unzip -q /tmp/cmdline-tools.zip -d /tmp/android-cli
+            mv /tmp/android-cli/cmdline-tools "$SDK_ROOT/cmdline-tools/latest"
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null || true
+          "$SDKMANAGER" --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: APK R1 preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAIN=android/app/src/main/java/tw/junba/transcriber/MainActivity.java
+          test -f "$MAIN"
+          test -f android/app/src/main/java/tw/junba/transcriber/LocalWhisperEngine.kt
+          test -f android/app/src/main/java/tw/junba/transcriber/AudioPreprocessor.kt
+          test -f android/app/src/main/java/tw/junba/transcriber/SecureKeyStore.java
+          grep -q 'versionCode = 383' android/app/build.gradle.kts
+          grep -q 'whisper-android:1.0.0' android/app/build.gradle.kts
+          if grep -q 'ffmpeg-kit-audio' android/app/build.gradle.kts; then
+            echo 'ffmpeg-kit-audio must not be packaged with whisper-android'
+            exit 1
+          fi
+          grep -q 'toggleKeyPanel' "$MAIN"
+          grep -q 'progressDetail' "$MAIN"
+          grep -q 'extractWordAnnotationTimeline' "$MAIN"
+          grep -q 'saveSessionBundle' "$MAIN"
+          grep -q 'MediaStore.MediaColumns.RELATIVE_PATH' "$MAIN"
+          grep -q 'gemini-3.8-flash' "$MAIN"
+          grep -q 'File.createTempFile("jba_"' "$MAIN"
+
+      - name: Compile Android Java and Kotlin
+        shell: bash
+        run: gradle -p android :app:compileDebugKotlin :app:compileDebugJavaWithJavac --no-daemon --stacktrace --refresh-dependencies
+
+      - name: Build APK
+        shell: bash
+        run: gradle -p android :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Package APK
+        shell: bash
+        run: |
+          mkdir -p r
+          cp android/app/build/outputs/apk/debug/app-debug.apk r/Junba-v3.8.2-APK-R1.apk
+          sha256sum r/Junba-v3.8.2-APK-R1.apk > r/SHA256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Junba-v382-APK-R1
+          path: |
+            r/Junba-v3.8.2-APK-R1.apk
+            r/SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: r/Junba-v3.8.2-APK-R1.apk
